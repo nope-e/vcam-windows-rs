@@ -2,8 +2,11 @@
 
 # Caution
 ## This project is fully written by AI and haven't be manually reviewed.
-## It currently stuuck in some bugs and cannot run properly.
+## It currently stuck in some bugs and cannot run properly.
+## There's no guarantee that this software will do no harm to your OS.
+## So, use at your own risk!
 
+# Intro
 这是一个基于 Rust 的 Windows 虚拟摄像头原型。当前实现使用 `windows-rs` 调用 Media Foundation / Win32 API，并通过自定义 COM 媒体源重复输出一张程序内生成的静态测试图。
 
 当前目标仍然是原型验证，不是可发布的生产级虚拟摄像头。
