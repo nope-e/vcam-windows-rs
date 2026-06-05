@@ -2,8 +2,8 @@
 
 # Caution
 ## This project is fully written by AI and haven't be manually reviewed.
-## It still has unresolved compatibility issues in some camera clients.
-## There's no guarantee that this software will do no harm to your OS.
+## It is now under its early development stage, and currently only displays a static test pattern at 1920*1080@60fps.
+## There is no implement of video/data feeding.
 ## So, use at your own risk!
 
 # Intro
