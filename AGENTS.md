@@ -27,11 +27,12 @@ Build a Windows virtual camera prototype in Rust that uses `windows-rs` for Medi
    - deterministic BGRA image
    - optional NV12 conversion for wider app compatibility
 3. CLI helper:
-   - `register-com`
-   - `unregister-com`
-   - `create-camera`
-   - `remove-camera`
-   - `dump-frame`
+  - `register-com`
+  - `unregister-com`
+  - `create-camera`
+  - `remove-camera`
+  - `dump-frame`
+  - `dump-com-frame`
 4. Minimal usage notes in the repository root if build/runtime caveats matter.
 
 ## Current Status
@@ -40,20 +41,23 @@ Build a Windows virtual camera prototype in Rust that uses `windows-rs` for Medi
   - crate converted to `cdylib + bin`
   - COM activation object, class factory, and exported DLL entrypoints implemented
   - static BGRA test-pattern generator and NV12 conversion implemented
-  - helper CLI implemented with `register-com`, `unregister-com`, `create-camera`, `remove-camera`, `probe-create`, and `dump-frame`
+  - helper CLI implemented with `register-com`, `unregister-com`, `create-camera`, `remove-camera`, `probe-create`, `dump-frame`, and `dump-com-frame`
   - PowerShell install/uninstall helper added
+  - direct COM frame-probe path added for local first-sample validation without camera enumeration
+  - uninstall path updated to stop `FrameServer` / `FrameServerMonitor` before removing the installed DLL
 - Verified:
   - `cargo build` passes
   - local `dump-frame` path writes a valid BMP
+  - local `dump-com-frame` path succeeds for both `RGB32` and `NV12`, and validates the payload against the in-memory test pattern
   - machine-wide COM registration allows the virtual camera device to appear in Windows enumeration
 - In progress:
   - some camera clients still show a black preview even though the device enumerates
-  - media stream was updated to prefer `IMFVideoSampleAllocator`, default `NV12`, stream frame-source attributes, and 2D surface writes; this needs reinstall and runtime verification in camera apps
+  - local COM frame delivery now works through the media source / media stream path, so the remaining gap is client-facing preview compatibility rather than basic first-frame delivery
 
 ## Current Debug Focus
 
 1. Reinstall the updated DLL and verify whether preview rendering now works in Windows Camera and other Media Foundation clients.
-2. If black preview persists, align `IMFMediaSource` / `IMFMediaStream` start-event payloads and presentation-descriptor behavior more closely with the Microsoft `SimpleMediaSource` sample.
+2. If black preview persists, compare the working local COM frame-probe path against the real virtual-camera client path, especially allocator negotiation, stream-event sequencing, and presentation-descriptor usage.
 3. Only after preview is stable, consider broader compatibility work such as richer allocator handling, timing polish, and additional media-type validation.
 
 ## Implementation Order

@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use windows::core::{implement, GUID, IUnknown, Interface, PCWSTR, Result};
-use windows::Win32::Foundation::{ERROR_SET_NOT_FOUND, E_POINTER, S_OK};
+use windows::Win32::Foundation::{BOOL, ERROR_SET_NOT_FOUND, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{IKsControl_Impl, KSIDENTIFIER};
 use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFGetService_Impl, IMFMediaEvent,
@@ -14,11 +14,13 @@ use windows::Win32::Media::MediaFoundation::{
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MFMEDIASOURCE_IS_LIVE,
     MF_E_INVALIDREQUEST, MF_E_SHUTDOWN, MF_E_UNSUPPORTED_SERVICE,
     MF_E_UNSUPPORTED_TIME_FORMAT, MENewStream, MESourceStarted, MESourceStopped,
-    MEUpdatedStream, MFSampleAllocatorUsage, MFSampleAllocatorUsage_UsesProvidedAllocator,
+    MEUpdatedStream, MFSampleAllocatorUsage, MFSampleAllocatorUsage_UsesCustomAllocator,
 };
 use windows_core::PROPVARIANT;
 
 use crate::constants::{FRIENDLY_NAME, STREAM_ID};
+use crate::debug_log;
+use crate::media_event::CustomMediaEvent;
 use crate::media_stream::{SourceReference, StaticImageMediaStream, StreamShared};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,15 +55,30 @@ impl SourceShared {
         Ok(descriptor)
     }
 
-    fn start(&self, descriptor: Option<&IMFPresentationDescriptor>) -> Result<()> {
+    fn start(
+        &self,
+        descriptor: Option<&IMFPresentationDescriptor>,
+        start_position: &PROPVARIANT,
+    ) -> Result<()> {
+        debug_log("SourceShared::start enter");
         self.ensure_active()?;
         if let Some(descriptor) = descriptor {
             unsafe {
                 descriptor.SelectStream(0)?;
             }
+            let mut selected = BOOL(0);
+            let mut stream_descriptor = None;
+            unsafe {
+                descriptor.GetStreamDescriptorByIndex(0, &mut selected, &mut stream_descriptor)?;
+            }
+            let stream_descriptor =
+                stream_descriptor.ok_or_else(|| windows::core::Error::from(E_POINTER))?;
+            let handler = unsafe { stream_descriptor.GetMediaTypeHandler()? };
+            let media_type = unsafe { handler.GetCurrentMediaType()? };
+            self.stream.set_current_media_type_override(media_type)?;
         }
 
-        let stream_unknown: IUnknown = self.stream.interface()?.cast()?;
+        let stream_iface = self.stream.interface2()?;
         let event_type = if *self.state.lock().expect("source state poisoned") == SourceState::Started
         {
             MEUpdatedStream
@@ -69,47 +86,32 @@ impl SourceShared {
             MENewStream
         };
 
-        self.stream.start()?;
-        unsafe {
-            self.event_queue.QueueEventParamUnk(
-                event_type.0 as u32,
-                std::ptr::null(),
-                S_OK,
-                &stream_unknown,
-            )?;
-        }
+        self.stream.start(start_position)?;
+        debug_log("SourceShared::start stream started");
+        debug_log("SourceShared::start before queue_unknown_event");
+        queue_unknown_event(&self.event_queue, event_type.0 as u32, &stream_iface.cast()?)?;
+        debug_log("SourceShared::start after queue_unknown_event");
         *self.state.lock().expect("source state poisoned") = SourceState::Started;
-        unsafe {
-            self.event_queue.QueueEventParamVar(
-                MESourceStarted.0 as u32,
-                std::ptr::null(),
-                S_OK,
-                std::ptr::null(),
-            )?;
-        }
+        queue_var_event(&self.event_queue, MESourceStarted.0 as u32, start_position)?;
+        debug_log("SourceShared::start exit");
         Ok(())
     }
 
     fn stop(&self) -> Result<()> {
+        debug_log("SourceShared::stop");
         self.ensure_active()?;
         if *self.state.lock().expect("source state poisoned") == SourceState::Stopped {
             return Ok(());
         }
         self.stream.stop()?;
+        let event_value = PROPVARIANT::new();
         *self.state.lock().expect("source state poisoned") = SourceState::Stopped;
-        unsafe {
-            self.event_queue
-                .QueueEventParamVar(
-                    MESourceStopped.0 as u32,
-                    std::ptr::null(),
-                    S_OK,
-                    std::ptr::null(),
-                )?;
-        }
+        queue_var_event(&self.event_queue, MESourceStopped.0 as u32, &event_value)?;
         Ok(())
     }
 
     fn shutdown(&self) -> Result<()> {
+        debug_log("SourceShared::shutdown");
         let mut state = self.state.lock().expect("source state poisoned");
         if *state == SourceState::Shutdown {
             return Ok(());
@@ -128,6 +130,7 @@ pub struct StaticImageMediaSource {
 
 impl StaticImageMediaSource {
     pub fn create() -> Result<IMFMediaSourceEx> {
+        debug_log("StaticImageMediaSource::create");
         let source_ref = SourceReference::new();
         let (stream_shared, _stream_iface) = StaticImageMediaStream::create(source_ref.clone())?;
         let stream_descriptors = [Some(stream_shared.descriptor())];
@@ -196,17 +199,24 @@ impl IMFMediaSource_Impl for StaticImageMediaSource_Impl {
         &self,
         ppresentationdescriptor: Option<&IMFPresentationDescriptor>,
         pguidtimeformat: *const GUID,
-        _pvarstartposition: *const PROPVARIANT,
+        pvarstartposition: *const PROPVARIANT,
     ) -> Result<()> {
+        debug_log("IMFMediaSource::Start");
         unsafe {
             if !pguidtimeformat.is_null() && *pguidtimeformat != GUID::zeroed() {
                 return Err(MF_E_UNSUPPORTED_TIME_FORMAT.into());
             }
         }
-        self.shared.start(ppresentationdescriptor)
+        let start_position = if pvarstartposition.is_null() {
+            0i64.into()
+        } else {
+            normalize_start_position(unsafe { (*pvarstartposition).clone() })
+        };
+        self.shared.start(ppresentationdescriptor, &start_position)
     }
 
     fn Stop(&self) -> Result<()> {
+        debug_log("IMFMediaSource::Stop");
         self.shared.stop()
     }
 
@@ -215,6 +225,7 @@ impl IMFMediaSource_Impl for StaticImageMediaSource_Impl {
     }
 
     fn Shutdown(&self) -> Result<()> {
+        debug_log("IMFMediaSource::Shutdown");
         self.shared.shutdown()
     }
 }
@@ -320,7 +331,7 @@ impl IMFSampleAllocatorControl_Impl for StaticImageMediaSource_Impl {
                 return Err(E_POINTER.into());
             }
             *pdwinputstreamid = dwoutputstreamid;
-            *peusage = MFSampleAllocatorUsage_UsesProvidedAllocator;
+            *peusage = MFSampleAllocatorUsage_UsesCustomAllocator;
         }
         Ok(())
     }
@@ -357,4 +368,30 @@ fn create_source_attributes() -> Result<IMFAttributes> {
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn normalize_start_position(value: PROPVARIANT) -> PROPVARIANT {
+    if value.is_empty() {
+        0i64.into()
+    } else {
+        value
+    }
+}
+
+fn queue_var_event(
+    queue: &windows::Win32::Media::MediaFoundation::IMFMediaEventQueue,
+    event_type: u32,
+    value: &PROPVARIANT,
+) -> Result<()> {
+    let event = CustomMediaEvent::from_propvariant(event_type, value.clone())?;
+    unsafe { queue.QueueEvent(&event) }
+}
+
+fn queue_unknown_event(
+    queue: &windows::Win32::Media::MediaFoundation::IMFMediaEventQueue,
+    event_type: u32,
+    value: &IUnknown,
+) -> Result<()> {
+    let event = CustomMediaEvent::from_unknown(event_type, value)?;
+    unsafe { queue.QueueEvent(&event) }
 }

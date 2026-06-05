@@ -6,6 +6,7 @@ use windows::Win32::Foundation::{CLASS_E_NOAGGREGATION, E_NOINTERFACE};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows_core::Interface;
 
+use crate::debug_log;
 use crate::activate::StaticCameraActivate;
 use crate::constants::ACTIVATE_CLSID;
 
@@ -19,6 +20,7 @@ impl IClassFactory_Impl for CameraActivateClassFactory_Impl {
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> Result<()> {
+        debug_log("IClassFactory::CreateInstance");
         unsafe {
             if ppvobject.is_null() {
                 return Err(windows::Win32::Foundation::E_POINTER.into());
@@ -55,6 +57,7 @@ pub fn dll_get_class_object(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> windows::core::HRESULT {
+    debug_log("class_factory::dll_get_class_object");
     unsafe {
         if ppv.is_null() || rclsid.is_null() || riid.is_null() {
             return windows::Win32::Foundation::E_POINTER;

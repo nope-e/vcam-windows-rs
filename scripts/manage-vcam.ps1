@@ -41,6 +41,31 @@ function Ensure-Admin {
     }
 }
 
+function Stop-FrameServerServices {
+    Ensure-Admin
+
+    $serviceNames = @('FrameServer', 'FrameServerMonitor')
+    foreach ($serviceName in $serviceNames) {
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($null -eq $service) {
+            continue
+        }
+
+        if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running) {
+            continue
+        }
+
+        if ($PSCmdlet.ShouldProcess($serviceName, 'Stop Frame Server related service')) {
+            Write-Step "Stop service $serviceName"
+            Stop-Service -Name $serviceName -Force -ErrorAction Stop
+            $service.WaitForStatus(
+                [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                [TimeSpan]::FromSeconds(15)
+            )
+        }
+    }
+}
+
 function Invoke-External {
     param(
         [Parameter(Mandatory = $true)]
@@ -189,6 +214,7 @@ switch ($Action) {
         }
 
         Invoke-VcamCtl -Arguments @('remove-camera') -DisplayName 'Remove virtual camera' -IgnoreFailure
+        Stop-FrameServerServices
         Unregister-InstalledDll
         Remove-InstalledDll
 

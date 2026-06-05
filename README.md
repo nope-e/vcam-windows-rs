@@ -2,7 +2,7 @@
 
 # Caution
 ## This project is fully written by AI and haven't be manually reviewed.
-## It currently stuck in some bugs and cannot run properly.
+## It still has unresolved compatibility issues in some camera clients.
 ## There's no guarantee that this software will do no harm to your OS.
 ## So, use at your own risk!
 
@@ -15,8 +15,9 @@
 
 - `cargo build` 通过。
 - `vcamctl dump-frame` 可以在本地导出静态测试图 BMP。
+- `vcamctl dump-com-frame` 和 `scripts/test-com-frame.ps1` 已验证可以直接通过 COM server 拉出首帧，并对 `RGB32` / `NV12` 两种格式做内容校验。
 - 使用机器级 COM 注册后，Windows 已经可以枚举到该虚拟摄像头设备。
-- 当前仍在继续排查部分应用中的预览黑屏问题；最近一轮已经把媒体流改为优先走 `IMFVideoSampleAllocator` + `NV12` + 2D surface 写入路径。
+- 当前仍在继续排查部分应用中的预览黑屏问题；最近一轮修复了自定义 stream/source 事件在系统 `MFCreateMediaEvent` / `QueueEventParam*` 路径上的崩溃，并把本地调试取帧路径切回稳定的内存 sample 分配。
 
 ## 环境要求
 
@@ -69,6 +70,7 @@ pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\manage-vcam.
 - 创建虚拟摄像头时使用的是 `System` 生命周期，因此设备不会随着 `vcamctl create-camera` 进程退出而立刻消失。
 - 重新编译后，如果安装路径和配置未变，通常重新执行 `Register` 和 `Create` 即可。
 - 如果你先前用 `Release` 安装，卸载时也应使用同样的 `-Configuration Release`。
+- `Uninstall` 现在会先尝试停止 `FrameServer` 和 `FrameServerMonitor`，减少 DLL 被系统占用导致删除失败的概率。
 
 ## CLI 命令
 
@@ -76,6 +78,18 @@ pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\manage-vcam.
 
 ```powershell
 cargo run --bin vcamctl -- dump-frame target\static-test-pattern.bmp
+```
+
+直接通过 COM server 拉一帧并导出为 BMP：
+
+```powershell
+cargo run --bin vcamctl -- dump-com-frame target\com-rgb32.bmp --subtype rgb32
+```
+
+也可以一次性验证两种格式：
+
+```powershell
+pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-com-frame.ps1
 ```
 
 探测当前系统是否支持创建虚拟摄像头对象：
@@ -107,13 +121,13 @@ cargo run --bin vcamctl -- remove-camera
 - 实现 `IMFActivate`、`IMFMediaSourceEx`、`IMFMediaStream2`、`IKsControl`、`IMFSampleAllocatorControl`。
 - 程序内生成固定测试图，不依赖运行时文件 IO。
 - 同时声明 `RGB32` 和 `NV12` 媒体类型。
-- 提供 COM 注册、虚拟摄像头创建/移除、测试帧导出的辅助 CLI。
+- 提供 COM 注册、虚拟摄像头创建/移除、测试帧导出、直接 COM 拉帧校验的辅助 CLI。
 
 ## 已知限制
 
 - 当前最稳定的安装路径是管理员 PowerShell 7 + 机器级 COM 注册。
-- 目前已经验证“本地导出测试图”和“设备可被系统枚举”，但“所有相机应用都能正常显示画面”仍未完全确认。
+- 目前已经验证“本地导出测试图”、“直接通过 COM server 拉出并校验首帧”以及“设备可被系统枚举”，但“所有相机应用都能正常显示画面”仍未完全确认。
 - 当前用户级 `HKCU` COM 注册不足以支撑这条虚拟摄像头激活路径。
-- 卸载前请先关闭正在占用该虚拟摄像头的应用，否则可能出现移除失败或 DLL 文件被占用。
+- `Uninstall` 会尝试先停止 `FrameServer` / `FrameServerMonitor`，但卸载前仍建议先关闭正在占用该虚拟摄像头的应用，否则仍可能出现移除失败或 DLL 文件被占用。
 - `FrameServer`、系统隐私设置、Windows 版本和具体调用方都可能影响最终预览结果。
 - 链接阶段会出现 `LNK4104` 警告，但目前不影响构建和原型调试。

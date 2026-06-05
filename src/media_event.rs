@@ -1,93 +1,67 @@
 use std::ffi::c_void;
-use std::ptr::null_mut;
-use std::sync::Mutex;
 
-use windows::core::{implement, GUID, IUnknown, PCWSTR, PWSTR, Result};
-use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER};
+use windows::core::{implement, GUID, HRESULT, IUnknown, PCWSTR, PWSTR, Result};
+use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFActivate_Impl, IMFAttributes, IMFAttributes_Impl, IMFMediaSource,
-    IMFMediaSourceEx, MFCreateAttributes, MF_ATTRIBUTE_TYPE, MF_ATTRIBUTES_MATCH_TYPE,
+    IMFAttributes, IMFAttributes_Impl, IMFMediaEvent, IMFMediaEvent_Impl, MFCreateAttributes,
+    MF_ATTRIBUTE_TYPE, MF_ATTRIBUTES_MATCH_TYPE,
 };
 use windows_core::{Interface, PROPVARIANT};
 
-use crate::debug_log;
-use crate::media_source::StaticImageMediaSource;
-
-#[implement(IMFActivate)]
-pub struct StaticCameraActivate {
+#[implement(IMFMediaEvent)]
+pub struct CustomMediaEvent {
     attributes: IMFAttributes,
-    active_source: Mutex<Option<IMFMediaSourceEx>>,
+    event_type: u32,
+    extended_type: GUID,
+    status: HRESULT,
+    value: PROPVARIANT,
 }
 
-impl StaticCameraActivate {
-    pub fn create() -> Result<IMFActivate> {
-        debug_log("StaticCameraActivate::create");
-        let attributes = create_attributes(8)?;
+impl CustomMediaEvent {
+    pub fn from_unknown(event_type: u32, unknown: &IUnknown) -> Result<IMFMediaEvent> {
+        Self::create(event_type, GUID::zeroed(), HRESULT(0), unknown.clone().into())
+    }
+
+    pub fn from_propvariant(event_type: u32, value: PROPVARIANT) -> Result<IMFMediaEvent> {
+        Self::create(event_type, GUID::zeroed(), HRESULT(0), value)
+    }
+
+    fn create(
+        event_type: u32,
+        extended_type: GUID,
+        status: HRESULT,
+        value: PROPVARIANT,
+    ) -> Result<IMFMediaEvent> {
         Ok(Self {
-            attributes,
-            active_source: Mutex::new(None),
+            attributes: create_attributes(4)?,
+            event_type,
+            extended_type,
+            status,
+            value,
         }
         .into())
     }
 }
 
-impl IMFActivate_Impl for StaticCameraActivate_Impl {
-    fn ActivateObject(&self, riid: *const GUID, ppv: *mut *mut c_void) -> Result<()> {
-        debug_log("IMFActivate::ActivateObject");
-        unsafe {
-            if riid.is_null() || ppv.is_null() {
-                return Err(E_POINTER.into());
-            }
-            *ppv = null_mut();
-        }
-
-        let source = StaticImageMediaSource::create()?;
-        *self.active_source.lock().expect("activate state poisoned") = Some(source.clone());
-
-        unsafe {
-            if *riid == IMFMediaSourceEx::IID {
-                *ppv = source.into_raw() as *mut c_void;
-                return Ok(());
-            }
-            if *riid == IMFMediaSource::IID {
-                *ppv = source.cast::<IMFMediaSource>()?.into_raw() as *mut c_void;
-                return Ok(());
-            }
-            if *riid == IUnknown::IID {
-                *ppv = source.cast::<IUnknown>()?.into_raw() as *mut c_void;
-                return Ok(());
-            }
-        }
-
-        Err(E_NOINTERFACE.into())
+impl IMFMediaEvent_Impl for CustomMediaEvent_Impl {
+    fn GetType(&self) -> Result<u32> {
+        Ok(self.event_type)
     }
 
-    fn ShutdownObject(&self) -> Result<()> {
-        debug_log("IMFActivate::ShutdownObject");
-        if let Some(source) = self
-            .active_source
-            .lock()
-            .expect("activate state poisoned")
-            .take()
-        {
-            unsafe {
-                source.cast::<IMFMediaSource>()?.Shutdown()?;
-            }
-        }
-        Ok(())
+    fn GetExtendedType(&self) -> Result<GUID> {
+        Ok(self.extended_type)
     }
 
-    fn DetachObject(&self) -> Result<()> {
-        debug_log("IMFActivate::DetachObject");
-        self.active_source
-            .lock()
-            .expect("activate state poisoned")
-            .take();
-        Ok(())
+    fn GetStatus(&self) -> Result<HRESULT> {
+        Ok(self.status)
+    }
+
+    fn GetValue(&self) -> Result<PROPVARIANT> {
+        Ok(self.value.clone())
     }
 }
 
-impl IMFAttributes_Impl for StaticCameraActivate_Impl {
+impl IMFAttributes_Impl for CustomMediaEvent_Impl {
     fn GetItem(&self, guidkey: *const GUID, pvalue: *mut PROPVARIANT) -> Result<()> {
         unsafe { self.attributes.GetItem(guidkey, if pvalue.is_null() { None } else { Some(pvalue) }) }
     }
@@ -96,7 +70,11 @@ impl IMFAttributes_Impl for StaticCameraActivate_Impl {
         unsafe { self.attributes.GetItemType(guidkey) }
     }
 
-    fn CompareItem(&self, guidkey: *const GUID, value: *const PROPVARIANT) -> Result<windows::Win32::Foundation::BOOL> {
+    fn CompareItem(
+        &self,
+        guidkey: *const GUID,
+        value: *const PROPVARIANT,
+    ) -> Result<windows::Win32::Foundation::BOOL> {
         unsafe { self.attributes.CompareItem(guidkey, value) }
     }
 
@@ -199,7 +177,12 @@ impl IMFAttributes_Impl for StaticCameraActivate_Impl {
         unsafe { self.attributes.GetAllocatedBlob(guidkey, ppbuf, pcbsize) }
     }
 
-    fn GetUnknown(&self, guidkey: *const GUID, riid: *const GUID, ppv: *mut *mut c_void) -> Result<()> {
+    fn GetUnknown(
+        &self,
+        guidkey: *const GUID,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> Result<()> {
         unsafe {
             if riid.is_null() || ppv.is_null() {
                 return Err(E_POINTER.into());
