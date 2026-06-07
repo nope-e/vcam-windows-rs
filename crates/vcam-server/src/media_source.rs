@@ -90,13 +90,14 @@ impl SourceShared {
             MENewStream
         };
 
-        self.stream.start(start_position)?;
-        debug_log("SourceShared::start stream started");
+        self.stream.prepare_start()?;
+        debug_log("SourceShared::start stream prepared");
         debug_log("SourceShared::start before queue_unknown_event");
         queue_unknown_event(&self.event_queue, event_type.0 as u32, &stream_iface.cast()?)?;
         debug_log("SourceShared::start after queue_unknown_event");
         *self.state.lock().expect("source state poisoned") = SourceState::Started;
         queue_var_event(&self.event_queue, MESourceStarted.0 as u32, start_position)?;
+        self.stream.queue_started_event(start_position)?;
         debug_log("SourceShared::start exit");
         Ok(())
     }

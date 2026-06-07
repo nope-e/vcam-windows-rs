@@ -9,7 +9,7 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFMediaType, IMFMediaTypeHandler, IMFSample,
     IMFStreamDescriptor, IMFVideoSampleAllocator, MF2DBuffer_LockFlags_Write, MFCreateAttributes,
     MFCreateEventQueue, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFCreateStreamDescriptor, MFGetSystemTime, MFMediaType_Video, MFVideoFormat_NV12,
+    MFCreateStreamDescriptor, MFMediaType_Video, MFVideoFormat_NV12,
     MFVideoFormat_RGB32, MFVideoInterlace_Progressive, MFSampleExtension_Token,
     MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEEndOfPresentation, MEMediaSample, MEStreamStarted,
     MEStreamStopped, MFFrameSourceTypes_Color, MF_E_INVALIDREQUEST, MF_E_SHUTDOWN,
@@ -226,6 +226,11 @@ struct CachedNv12Frame {
     bytes: Arc<[u8]>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct StreamTimeline {
+    next_sample_time_100ns: i64,
+}
+
 pub struct StreamShared {
     source_ref: SourceReference,
     self_iface: Mutex<Option<IMFMediaStream>>,
@@ -239,6 +244,7 @@ pub struct StreamShared {
     selected_media_type: Mutex<Option<IMFMediaType>>,
     sample_allocator: Mutex<SampleAllocatorState>,
     nv12_cache: Mutex<Option<CachedNv12Frame>>,
+    timeline: Mutex<StreamTimeline>,
 }
 
 impl StreamShared {
@@ -290,6 +296,7 @@ impl StreamShared {
             selected_media_type: Mutex::new(None),
             sample_allocator: Mutex::new(SampleAllocatorState { allocator: None }),
             nv12_cache: Mutex::new(None),
+            timeline: Mutex::new(StreamTimeline::default()),
         }))
     }
 
@@ -328,10 +335,18 @@ impl StreamShared {
         Ok(self.state.lock().expect("stream state poisoned").stream_state)
     }
 
-    pub fn start(&self, start_position: &PROPVARIANT) -> Result<()> {
-        debug_log("StreamShared::start");
+    pub fn prepare_start(&self) -> Result<()> {
+        debug_log("StreamShared::prepare_start");
         self.ensure_active()?;
         self.state.lock().expect("stream state poisoned").stream_state = MF_STREAM_STATE_RUNNING;
+        self.timeline
+            .lock()
+            .expect("stream timeline poisoned")
+            .next_sample_time_100ns = 0;
+        Ok(())
+    }
+
+    pub fn queue_started_event(&self, start_position: &PROPVARIANT) -> Result<()> {
         queue_var_event(&self.event_queue, MEStreamStarted.0 as u32, start_position)
     }
 
@@ -406,9 +421,8 @@ impl StreamShared {
         let media_type = self.current_media_type()?;
         let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE)? };
         let frame = self.providers.current_frame()?;
-        let sample_time_100ns = frame
-            .sample_time_100ns
-            .unwrap_or_else(|| unsafe { MFGetSystemTime() });
+        let _feed_timestamp_100ns = frame.sample_time_100ns;
+        let sample_time_100ns = self.next_sample_time_100ns();
 
         let frame_bytes: Arc<[u8]> = if subtype == MFVideoFormat_NV12 {
             self.current_nv12_frame(&frame)?
@@ -457,6 +471,15 @@ impl StreamShared {
 
         debug_log("StreamShared::allocate_sample using memory buffer fallback");
         create_memory_backed_sample(buffer_size)
+    }
+
+    fn next_sample_time_100ns(&self) -> i64 {
+        let mut timeline = self.timeline.lock().expect("stream timeline poisoned");
+        let current = timeline.next_sample_time_100ns;
+        timeline.next_sample_time_100ns = timeline
+            .next_sample_time_100ns
+            .saturating_add(self.format.frame_duration_100ns());
+        current
     }
 
     fn current_nv12_frame(&self, frame: &ProvidedFrame) -> Result<Arc<[u8]>> {
