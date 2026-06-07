@@ -14,7 +14,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MFMEDIASOURCE_IS_LIVE,
     MF_E_INVALIDREQUEST, MF_E_SHUTDOWN, MF_E_UNSUPPORTED_SERVICE,
     MF_E_UNSUPPORTED_TIME_FORMAT, MENewStream, MESourceStarted, MESourceStopped,
-    MEUpdatedStream, MFSampleAllocatorUsage, MFSampleAllocatorUsage_UsesCustomAllocator,
+    MEUpdatedStream, MFSampleAllocatorUsage, MFSampleAllocatorUsage_UsesProvidedAllocator,
 };
 use windows_core::PROPVARIANT;
 
@@ -348,7 +348,7 @@ impl IMFSampleAllocatorControl_Impl for StaticImageMediaSource_Impl {
                 return Err(E_POINTER.into());
             }
             *pdwinputstreamid = dwoutputstreamid;
-            *peusage = MFSampleAllocatorUsage_UsesCustomAllocator;
+            *peusage = MFSampleAllocatorUsage_UsesProvidedAllocator;
         }
         Ok(())
     }

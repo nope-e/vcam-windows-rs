@@ -416,7 +416,7 @@ impl StreamShared {
             frame.bgra.clone()
         };
 
-        let sample = create_memory_backed_sample(frame_bytes.len() as u32)?;
+        let sample = self.allocate_sample(frame_bytes.len() as u32, &media_type)?;
         let buffer: IMFMediaBuffer = unsafe { sample.GetBufferByIndex(0)? };
         unsafe {
             self.write_frame_to_buffer(&buffer, subtype, frame_bytes.as_ref())?;
@@ -430,6 +430,33 @@ impl StreamShared {
             queue_unknown_event(&self.event_queue, MEMediaSample.0 as u32, &sample_unknown)?;
         }
         Ok(())
+    }
+
+    fn allocate_sample(&self, buffer_size: u32, media_type: &IMFMediaType) -> Result<IMFSample> {
+        let allocator = self
+            .sample_allocator
+            .lock()
+            .expect("sample allocator state poisoned")
+            .allocator
+            .clone();
+        if let Some(allocator) = allocator {
+            debug_log("StreamShared::allocate_sample using provided allocator");
+            match unsafe { allocator.AllocateSample() } {
+                Ok(sample) => return Ok(sample),
+                Err(err) => {
+                    debug_log(&format!(
+                        "provided allocator AllocateSample failed, falling back to memory buffer: {err}"
+                    ));
+                    let _ = unsafe { allocator.InitializeSampleAllocator(3, media_type) };
+                    if let Ok(sample) = unsafe { allocator.AllocateSample() } {
+                        return Ok(sample);
+                    }
+                }
+            }
+        }
+
+        debug_log("StreamShared::allocate_sample using memory buffer fallback");
+        create_memory_backed_sample(buffer_size)
     }
 
     fn current_nv12_frame(&self, frame: &ProvidedFrame) -> Result<Arc<[u8]>> {
