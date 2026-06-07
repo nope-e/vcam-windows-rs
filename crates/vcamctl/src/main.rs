@@ -19,7 +19,8 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 use vcam_server::{
-    debug_log, validate_dump_path, write_bgra_bmp, write_nv12_bmp, StaticTestPattern, ACTIVATE_CLSID,
+    debug_log, query_feed_state, validate_dump_path, write_bgra_bmp_for_format,
+    write_nv12_bmp_for_format, StaticTestPattern, VideoFormat, ACTIVATE_CLSID,
     ACTIVATE_CLSID_STRING, FRIENDLY_NAME,
 };
 use vcam_server::registration::{self, RegistryScope};
@@ -92,10 +93,14 @@ fn main() -> Result<()> {
             validate_dump_path(&options.path)?;
             let report = dump_com_frame(&options)?;
             println!(
-                "wrote {} via COM server ({}, {} bytes, content verified)",
+                "wrote {} via COM server ({} {}x{}, {} bytes, {}, sample time {})",
                 options.path.display(),
                 report.subtype.label(),
+                report.format.width,
+                report.format.height,
                 report.byte_len,
+                report.verification.message(),
+                report.sample_time_100ns,
             );
         }
         _ => print_usage(),
@@ -159,7 +164,29 @@ struct DumpComFrameOptions {
 
 struct DumpComFrameReport {
     subtype: FrameSubtype,
+    format: VideoFormat,
     byte_len: usize,
+    sample_time_100ns: i64,
+    verification: VerificationResult,
+}
+
+enum VerificationResult {
+    StaticPatternVerified,
+    DynamicFrameCaptured,
+}
+
+impl VerificationResult {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::StaticPatternVerified => "static content verified",
+            Self::DynamicFrameCaptured => "dynamic frame captured",
+        }
+    }
+}
+
+struct PresentationFormat {
+    subtype: FrameSubtype,
+    video: VideoFormat,
 }
 
 fn parse_registration_options(args: &[String]) -> Result<RegistrationOptions> {
@@ -315,19 +342,25 @@ fn dump_com_frame(options: &DumpComFrameOptions) -> Result<DumpComFrameReport> {
 
         let sample = wait_for_sample_from_stream(&stream)?;
         debug_log("dump_com_frame after wait_for_sample_from_stream");
-        let actual_subtype = current_presentation_subtype(&presentation_descriptor)?;
+        let actual_format = current_presentation_format(&presentation_descriptor)?;
+        let actual_subtype = actual_format.subtype;
         debug_log("dump_com_frame after current_presentation_subtype");
+        let sample_time_100ns = read_sample_time(&sample)?;
         let frame_bytes = read_sample_bytes(&sample)?;
         debug_log("dump_com_frame after read_sample_bytes");
 
-        write_frame_dump(&options.path, actual_subtype, &frame_bytes)?;
+        write_frame_dump(&options.path, actual_subtype, actual_format.video, &frame_bytes)?;
         debug_log("dump_com_frame after write_frame_dump");
-        verify_frame_payload(actual_subtype, &frame_bytes)?;
+        let verification =
+            verify_frame_payload(actual_subtype, actual_format.video, sample_time_100ns, &frame_bytes)?;
         debug_log("dump_com_frame after verify_frame_payload");
 
         Ok(DumpComFrameReport {
             subtype: actual_subtype,
+            format: actual_format.video,
             byte_len: frame_bytes.len(),
+            sample_time_100ns,
+            verification,
         })
     })();
 
@@ -356,18 +389,30 @@ fn startup_media_foundation() -> Result<()> {
     unsafe { MFStartup(version, MFSTARTUP_FULL) }
 }
 
-fn current_presentation_subtype(
+fn current_presentation_format(
     presentation_descriptor: &windows::Win32::Media::MediaFoundation::IMFPresentationDescriptor,
-) -> Result<FrameSubtype> {
+) -> Result<PresentationFormat> {
     let stream_descriptor = get_stream_descriptor(presentation_descriptor)?;
     let handler = unsafe { stream_descriptor.GetMediaTypeHandler()? };
     let media_type = unsafe { handler.GetCurrentMediaType()? };
     let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE)? };
-    FrameSubtype::from_guid(subtype).ok_or_else(|| {
+    let subtype = FrameSubtype::from_guid(subtype).ok_or_else(|| {
         Error::new(
             E_FAIL.into(),
             format!("presentation descriptor returned unsupported subtype {subtype:?}"),
         )
+    })?;
+    let frame_size = unsafe {
+        media_type.GetUINT64(&windows::Win32::Media::MediaFoundation::MF_MT_FRAME_SIZE)?
+    };
+    let frame_rate = unsafe {
+        media_type.GetUINT64(&windows::Win32::Media::MediaFoundation::MF_MT_FRAME_RATE)?
+    };
+    let (width, height) = unpack_u32_pair(frame_size);
+    let (fps_num, fps_den) = unpack_u32_pair(frame_rate);
+    Ok(PresentationFormat {
+        subtype,
+        video: VideoFormat::new(width, height, fps_num, fps_den)?,
     })
 }
 
@@ -494,22 +539,56 @@ fn read_sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn write_frame_dump(path: &PathBuf, subtype: FrameSubtype, frame_bytes: &[u8]) -> Result<()> {
+fn read_sample_time(sample: &IMFSample) -> Result<i64> {
+    unsafe { sample.GetSampleTime() }
+}
+
+fn write_frame_dump(
+    path: &PathBuf,
+    subtype: FrameSubtype,
+    format: VideoFormat,
+    frame_bytes: &[u8],
+) -> Result<()> {
     match subtype {
-        FrameSubtype::Rgb32 => write_bgra_bmp(path, frame_bytes),
-        FrameSubtype::Nv12 => write_nv12_bmp(path, frame_bytes),
+        FrameSubtype::Rgb32 => write_bgra_bmp_for_format(path, format, frame_bytes),
+        FrameSubtype::Nv12 => write_nv12_bmp_for_format(path, format, frame_bytes),
     }
 }
 
-fn verify_frame_payload(subtype: FrameSubtype, frame_bytes: &[u8]) -> Result<()> {
-    let expected_pattern = StaticTestPattern::new();
+fn verify_frame_payload(
+    subtype: FrameSubtype,
+    format: VideoFormat,
+    sample_time_100ns: i64,
+    frame_bytes: &[u8],
+) -> Result<VerificationResult> {
+    if query_feed_state()?.is_active() {
+        let expected_len = match subtype {
+            FrameSubtype::Rgb32 => format.bgra_frame_bytes(),
+            FrameSubtype::Nv12 => format.nv12_frame_bytes(),
+        };
+        if sample_time_100ns <= 0 {
+            return Err(Error::new(E_FAIL.into(), "COM sample is missing a positive sample time"));
+        }
+        if frame_bytes.len() != expected_len {
+            return Err(Error::new(
+                E_FAIL.into(),
+                format!(
+                    "COM dynamic sample size mismatch: expected {expected_len} bytes, got {}",
+                    frame_bytes.len()
+                ),
+            ));
+        }
+        return Ok(VerificationResult::DynamicFrameCaptured);
+    }
+
+    let expected_pattern = StaticTestPattern::with_format(format);
     let expected = match subtype {
         FrameSubtype::Rgb32 => expected_pattern.rgb32_bytes(),
         FrameSubtype::Nv12 => expected_pattern.nv12_bytes(),
     };
 
     if frame_bytes == expected {
-        return Ok(());
+        return Ok(VerificationResult::StaticPatternVerified);
     }
 
     Err(Error::new(
@@ -574,6 +653,10 @@ fn invoke_dll_export(export: &str, dll_path: PathBuf) -> Result<()> {
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn unpack_u32_pair(value: u64) -> (u32, u32) {
+    ((value >> 32) as u32, value as u32)
 }
 
 fn print_usage() {

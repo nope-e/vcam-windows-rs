@@ -5,32 +5,32 @@ use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Media::KernelStreaming::PINNAME_VIDEO_CAPTURE;
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMF2DBuffer2, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaBuffer,
-    IMFMediaEvent,
-    IMFMediaEventGenerator_Impl, IMFMediaSource, IMFMediaStream, IMFMediaStream2,
+    IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaSource, IMFMediaStream, IMFMediaStream2,
     IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFMediaType, IMFMediaTypeHandler, IMFSample,
     IMFStreamDescriptor, IMFVideoSampleAllocator, MF2DBuffer_LockFlags_Write, MFCreateAttributes,
     MFCreateEventQueue, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFCreateStreamDescriptor, MFGetSystemTime, MFMediaType_Video, MFVideoFormat_NV12,
-    MFVideoFormat_RGB32,
-    MFVideoInterlace_Progressive, MFSampleExtension_Token, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
-    MEEndOfPresentation, MEMediaSample, MEStreamStarted, MEStreamStopped, MFFrameSourceTypes_Color,
-    MF_E_INVALIDREQUEST, MF_E_SHUTDOWN, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_RATE_RANGE_MAX, MF_MT_FRAME_RATE_RANGE_MIN, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE,
-    MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED,
+    MFVideoFormat_RGB32, MFVideoInterlace_Progressive, MFSampleExtension_Token,
+    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEEndOfPresentation, MEMediaSample, MEStreamStarted,
+    MEStreamStopped, MFFrameSourceTypes_Color, MF_E_INVALIDREQUEST, MF_E_SHUTDOWN,
+    MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE, MF_MT_FRAME_RATE_RANGE_MAX,
+    MF_MT_FRAME_RATE_RANGE_MIN, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE,
+    MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED,
     MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MF_DEVICESTREAM_FRAMESERVER_SHARED,
     MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID,
 };
 use windows_core::PROPVARIANT;
 
-use crate::constants::{
-    BGRA_FRAME_BYTES, FRAME_DURATION_100NS, FRAME_HEIGHT, FRAME_RATE_DENOMINATOR,
-    FRAME_RATE_NUMERATOR, FRAME_WIDTH, NV12_FRAME_BYTES, STREAM_ID,
-};
+use crate::constants::STREAM_ID;
 use crate::debug_log;
+use crate::feed_shared::{FeedFrame, FeedSessionReader};
 use crate::media_event::CustomMediaEvent;
-use crate::test_pattern::StaticTestPattern;
+use crate::test_pattern::{
+    bgra_to_nv12_bytes, copy_bgra_to_surface, copy_nv12_to_surface, StaticTestPattern,
+};
+use crate::video_format::VideoFormat;
 
 #[derive(Clone)]
 pub struct SourceReference {
@@ -68,6 +68,164 @@ struct SampleAllocatorState {
     allocator: Option<IMFVideoSampleAllocator>,
 }
 
+#[derive(Clone)]
+struct ProvidedFrame {
+    frame_id: u64,
+    sample_time_100ns: Option<i64>,
+    bgra: Arc<[u8]>,
+    nv12: Option<Arc<[u8]>>,
+}
+
+#[derive(Clone)]
+struct StaticPatternProvider {
+    pattern: StaticTestPattern,
+}
+
+impl StaticPatternProvider {
+    fn new(format: VideoFormat) -> Self {
+        Self {
+            pattern: StaticTestPattern::with_format(format),
+        }
+    }
+
+    fn current_frame(&self) -> ProvidedFrame {
+        ProvidedFrame {
+            frame_id: 0,
+            sample_time_100ns: None,
+            bgra: self.pattern.rgb32_arc(),
+            nv12: Some(self.pattern.nv12_arc()),
+        }
+    }
+}
+
+pub(crate) struct SharedMemoryFeedProvider {
+    reader: FeedSessionReader,
+    last_successful: Mutex<Option<FeedFrame>>,
+}
+
+impl SharedMemoryFeedProvider {
+    fn open_active() -> Result<Option<Self>> {
+        Ok(FeedSessionReader::open_active()?.map(|reader| Self {
+            reader,
+            last_successful: Mutex::new(None),
+        }))
+    }
+
+    fn open_matching(format: VideoFormat) -> Result<Option<Self>> {
+        let Some(provider) = Self::open_active()? else {
+            return Ok(None);
+        };
+        if provider.format() == format {
+            Ok(Some(provider))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn format(&self) -> VideoFormat {
+        self.reader
+            .config()
+            .video_format()
+            .expect("validated feed session config must produce a valid video format")
+    }
+
+    fn is_active(&self) -> bool {
+        self.reader.is_active()
+    }
+
+    fn try_current_frame(&self) -> Result<Option<ProvidedFrame>> {
+        if !self.reader.is_active() {
+            self.last_successful
+                .lock()
+                .expect("shared provider cache poisoned")
+                .take();
+            return Ok(None);
+        }
+
+        if let Some(frame) = self.reader.try_read_latest_frame()? {
+            *self
+                .last_successful
+                .lock()
+                .expect("shared provider cache poisoned") = Some(frame.clone());
+            return Ok(Some(ProvidedFrame {
+                frame_id: frame.frame_id,
+                sample_time_100ns: Some(frame.timestamp_100ns),
+                bgra: frame.bgra,
+                nv12: None,
+            }));
+        }
+
+        let cached = self
+            .last_successful
+            .lock()
+            .expect("shared provider cache poisoned")
+            .clone();
+        Ok(cached.map(|frame| ProvidedFrame {
+            frame_id: frame.frame_id,
+            sample_time_100ns: Some(frame.timestamp_100ns),
+            bgra: frame.bgra,
+            nv12: None,
+        }))
+    }
+}
+
+struct FrameProviders {
+    static_provider: StaticPatternProvider,
+    stream_format: VideoFormat,
+    shared_provider: Mutex<Option<SharedMemoryFeedProvider>>,
+}
+
+impl FrameProviders {
+    fn new(format: VideoFormat, shared_provider: Option<SharedMemoryFeedProvider>) -> Self {
+        Self {
+            static_provider: StaticPatternProvider::new(format),
+            stream_format: format,
+            shared_provider: Mutex::new(shared_provider),
+        }
+    }
+
+    fn current_frame(&self) -> Result<ProvidedFrame> {
+        if let Some(frame) = self.try_shared_frame()? {
+            return Ok(frame);
+        }
+        Ok(self.static_provider.current_frame())
+    }
+
+    fn try_shared_frame(&self) -> Result<Option<ProvidedFrame>> {
+        {
+            let mut provider = self
+                .shared_provider
+                .lock()
+                .expect("shared provider state poisoned");
+            if let Some(active_provider) = provider.as_ref() {
+                let frame = active_provider.try_current_frame()?;
+                if !active_provider.is_active() {
+                    *provider = None;
+                }
+                if frame.is_some() {
+                    return Ok(frame);
+                }
+            }
+        }
+
+        let Some(provider) = SharedMemoryFeedProvider::open_matching(self.stream_format)? else {
+            return Ok(None);
+        };
+        let frame = provider.try_current_frame()?;
+        *self
+            .shared_provider
+            .lock()
+            .expect("shared provider state poisoned") = Some(provider);
+        Ok(frame)
+    }
+}
+
+#[derive(Clone)]
+struct CachedNv12Frame {
+    frame_id: u64,
+    bytes: Arc<[u8]>,
+}
+
 pub struct StreamShared {
     source_ref: SourceReference,
     self_iface: Mutex<Option<IMFMediaStream>>,
@@ -75,19 +233,25 @@ pub struct StreamShared {
     event_queue: windows::Win32::Media::MediaFoundation::IMFMediaEventQueue,
     descriptor: IMFStreamDescriptor,
     attributes: IMFAttributes,
-    pattern: StaticTestPattern,
+    format: VideoFormat,
+    providers: FrameProviders,
     state: Mutex<StreamState>,
     selected_media_type: Mutex<Option<IMFMediaType>>,
     sample_allocator: Mutex<SampleAllocatorState>,
+    nv12_cache: Mutex<Option<CachedNv12Frame>>,
 }
 
 impl StreamShared {
-    pub fn create(source_ref: SourceReference) -> Result<Arc<Self>> {
+    pub(crate) fn create(
+        source_ref: SourceReference,
+        format: VideoFormat,
+        shared_provider: Option<SharedMemoryFeedProvider>,
+    ) -> Result<Arc<Self>> {
         debug_log("StreamShared::create");
         let attributes = create_attributes(10)?;
         let event_queue = unsafe { MFCreateEventQueue()? };
-        let rgb32 = create_media_type(MFVideoFormat_RGB32, BGRA_FRAME_BYTES as u32, FRAME_WIDTH * 4)?;
-        let nv12 = create_media_type(MFVideoFormat_NV12, NV12_FRAME_BYTES as u32, FRAME_WIDTH)?;
+        let rgb32 = create_media_type(format, MFVideoFormat_RGB32)?;
+        let nv12 = create_media_type(format, MFVideoFormat_NV12)?;
         let media_types = [Some(rgb32.clone()), Some(nv12.clone())];
         let descriptor = unsafe { MFCreateStreamDescriptor(STREAM_ID, &media_types)? };
         let handler: IMFMediaTypeHandler = unsafe { descriptor.GetMediaTypeHandler()? };
@@ -117,15 +281,15 @@ impl StreamShared {
             event_queue,
             descriptor,
             attributes,
-            pattern: StaticTestPattern::new(),
+            format,
+            providers: FrameProviders::new(format, shared_provider),
             state: Mutex::new(StreamState {
                 stream_state: MF_STREAM_STATE_STOPPED,
                 shutdown: false,
             }),
             selected_media_type: Mutex::new(None),
-            sample_allocator: Mutex::new(SampleAllocatorState {
-                allocator: None,
-            }),
+            sample_allocator: Mutex::new(SampleAllocatorState { allocator: None }),
+            nv12_cache: Mutex::new(None),
         }))
     }
 
@@ -135,14 +299,6 @@ impl StreamShared {
 
     pub fn bind2(&self, stream: IMFMediaStream2) {
         *self.self_iface2.lock().expect("stream2 reference poisoned") = Some(stream);
-    }
-
-    pub fn interface(&self) -> Result<IMFMediaStream> {
-        self.self_iface
-            .lock()
-            .expect("stream reference poisoned")
-            .clone()
-            .ok_or_else(|| E_POINTER.into())
     }
 
     pub fn interface2(&self) -> Result<IMFMediaStream2> {
@@ -173,24 +329,17 @@ impl StreamShared {
     }
 
     pub fn start(&self, start_position: &PROPVARIANT) -> Result<()> {
-        debug_log("StreamShared::start enter");
+        debug_log("StreamShared::start");
         self.ensure_active()?;
-        debug_log("StreamShared::start after ensure_active");
         self.state.lock().expect("stream state poisoned").stream_state = MF_STREAM_STATE_RUNNING;
-        debug_log("StreamShared::start after state set");
-        debug_log("StreamShared::start before queue_var_event");
-        queue_var_event(&self.event_queue, MEStreamStarted.0 as u32, start_position)?;
-        debug_log("StreamShared::start after queue_var_event");
-        debug_log("StreamShared::start exit");
-        Ok(())
+        queue_var_event(&self.event_queue, MEStreamStarted.0 as u32, start_position)
     }
 
     pub fn stop(&self) -> Result<()> {
         self.ensure_active()?;
         self.state.lock().expect("stream state poisoned").stream_state = MF_STREAM_STATE_STOPPED;
         let event_value = PROPVARIANT::new();
-        queue_var_event(&self.event_queue, MEStreamStopped.0 as u32, &event_value)?;
-        Ok(())
+        queue_var_event(&self.event_queue, MEStreamStopped.0 as u32, &event_value)
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -240,16 +389,15 @@ impl StreamShared {
     pub fn set_sample_allocator(&self, allocator: Option<IMFVideoSampleAllocator>) -> Result<()> {
         debug_log("StreamShared::set_sample_allocator");
         self.ensure_active()?;
-        let mut state = self
-            .sample_allocator
+        self.sample_allocator
             .lock()
-            .expect("sample allocator state poisoned");
-        state.allocator = allocator;
+            .expect("sample allocator state poisoned")
+            .allocator = allocator;
         Ok(())
     }
 
     pub fn request_sample(&self, token: Option<&IUnknown>) -> Result<()> {
-        debug_log("StreamShared::request_sample enter");
+        debug_log("StreamShared::request_sample");
         self.ensure_active()?;
         if self.current_stream_state()? != MF_STREAM_STATE_RUNNING {
             return Err(MF_E_INVALIDREQUEST.into());
@@ -257,30 +405,51 @@ impl StreamShared {
 
         let media_type = self.current_media_type()?;
         let subtype = unsafe { media_type.GetGUID(&MF_MT_SUBTYPE)? };
-        let frame_bytes = if subtype == MFVideoFormat_NV12 {
-            self.pattern.nv12_bytes()
+        let frame = self.providers.current_frame()?;
+        let sample_time_100ns = frame
+            .sample_time_100ns
+            .unwrap_or_else(|| unsafe { MFGetSystemTime() });
+
+        let frame_bytes: Arc<[u8]> = if subtype == MFVideoFormat_NV12 {
+            self.current_nv12_frame(&frame)?
         } else {
-            self.pattern.rgb32_bytes()
+            frame.bgra.clone()
         };
 
         let sample = create_memory_backed_sample(frame_bytes.len() as u32)?;
-        debug_log("StreamShared::request_sample allocated sample");
         let buffer: IMFMediaBuffer = unsafe { sample.GetBufferByIndex(0)? };
-        debug_log("StreamShared::request_sample got buffer");
         unsafe {
-            self.write_frame_to_buffer(&buffer, subtype, frame_bytes)?;
-            debug_log("StreamShared::request_sample wrote buffer");
+            self.write_frame_to_buffer(&buffer, subtype, frame_bytes.as_ref())?;
             buffer.SetCurrentLength(frame_bytes.len() as u32)?;
-            sample.SetSampleTime(MFGetSystemTime())?;
-            sample.SetSampleDuration(FRAME_DURATION_100NS)?;
+            sample.SetSampleTime(sample_time_100ns)?;
+            sample.SetSampleDuration(self.format.frame_duration_100ns())?;
             if let Some(token) = token {
                 sample.SetUnknown(&MFSampleExtension_Token, token)?;
             }
             let sample_unknown: IUnknown = sample.cast()?;
             queue_unknown_event(&self.event_queue, MEMediaSample.0 as u32, &sample_unknown)?;
         }
-        debug_log("StreamShared::request_sample exit");
         Ok(())
+    }
+
+    fn current_nv12_frame(&self, frame: &ProvidedFrame) -> Result<Arc<[u8]>> {
+        if let Some(nv12) = &frame.nv12 {
+            return Ok(nv12.clone());
+        }
+
+        let mut cache = self.nv12_cache.lock().expect("NV12 cache poisoned");
+        if let Some(cached) = &*cache {
+            if cached.frame_id == frame.frame_id {
+                return Ok(cached.bytes.clone());
+            }
+        }
+
+        let converted = Arc::<[u8]>::from(bgra_to_nv12_bytes(self.format, frame.bgra.as_ref())?);
+        *cache = Some(CachedNv12Frame {
+            frame_id: frame.frame_id,
+            bytes: converted.clone(),
+        });
+        Ok(converted)
     }
 
     fn write_frame_to_buffer(
@@ -289,9 +458,7 @@ impl StreamShared {
         subtype: GUID,
         frame_bytes: &[u8],
     ) -> Result<()> {
-        debug_log("StreamShared::write_frame_to_buffer");
         if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
-            debug_log("StreamShared::write_frame_to_buffer 2d");
             unsafe {
                 let mut scanline0 = std::ptr::null_mut();
                 let mut pitch = 0i32;
@@ -305,11 +472,9 @@ impl StreamShared {
                     &mut buffer_len,
                 )?;
                 let write_result = if subtype == MFVideoFormat_NV12 {
-                    self.pattern
-                        .copy_to_nv12_surface(scanline0, pitch, buffer_start, buffer_len)
+                    copy_nv12_to_surface(self.format, frame_bytes, scanline0, pitch, buffer_start, buffer_len)
                 } else {
-                    self.pattern
-                        .copy_to_rgb32_surface(scanline0, pitch, buffer_len)
+                    copy_bgra_to_surface(self.format, frame_bytes, scanline0, pitch, buffer_len)
                 };
                 let unlock_result = buffer2d.Unlock2D();
                 write_result?;
@@ -319,17 +484,11 @@ impl StreamShared {
         }
 
         if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer>() {
-            debug_log("StreamShared::write_frame_to_buffer contiguous 2d");
             unsafe {
-                return if subtype == MFVideoFormat_NV12 {
-                    buffer2d.ContiguousCopyFrom(self.pattern.nv12_bytes())
-                } else {
-                    buffer2d.ContiguousCopyFrom(self.pattern.rgb32_bytes())
-                };
+                return buffer2d.ContiguousCopyFrom(frame_bytes);
             }
         }
 
-        debug_log("StreamShared::write_frame_to_buffer lock copy");
         unsafe {
             let mut raw = std::ptr::null_mut();
             let mut max_len = 0u32;
@@ -349,8 +508,7 @@ impl StreamShared {
     pub fn end_of_stream(&self) -> Result<()> {
         self.ensure_active()?;
         let event_value = PROPVARIANT::new();
-        queue_var_event(&self.event_queue, MEEndOfPresentation.0 as u32, &event_value)?;
-        Ok(())
+        queue_var_event(&self.event_queue, MEEndOfPresentation.0 as u32, &event_value)
     }
 }
 
@@ -360,8 +518,12 @@ pub struct StaticImageMediaStream {
 }
 
 impl StaticImageMediaStream {
-    pub fn create(source_ref: SourceReference) -> Result<(Arc<StreamShared>, IMFMediaStream)> {
-        let shared = StreamShared::create(source_ref)?;
+    pub(crate) fn create(
+        source_ref: SourceReference,
+        format: VideoFormat,
+        shared_provider: Option<SharedMemoryFeedProvider>,
+    ) -> Result<(Arc<StreamShared>, IMFMediaStream)> {
+        let shared = StreamShared::create(source_ref, format, shared_provider)?;
         let stream: IMFMediaStream = Self {
             shared: shared.clone(),
         }
@@ -438,23 +600,31 @@ fn create_attributes(initial_size: u32) -> Result<IMFAttributes> {
     attributes.ok_or_else(|| Error::from(E_POINTER))
 }
 
-fn create_media_type(subtype: GUID, sample_size: u32, stride: u32) -> Result<IMFMediaType> {
+fn create_media_type(format: VideoFormat, subtype: GUID) -> Result<IMFMediaType> {
+    let sample_size = if subtype == MFVideoFormat_NV12 {
+        format.nv12_frame_bytes() as u32
+    } else {
+        format.bgra_frame_bytes() as u32
+    };
+    let stride = if subtype == MFVideoFormat_NV12 {
+        format.nv12_stride() as u32
+    } else {
+        format.bgra_stride() as u32
+    };
+
     let media_type = unsafe { MFCreateMediaType()? };
     unsafe {
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
-        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(FRAME_WIDTH, FRAME_HEIGHT))?;
-        media_type.SetUINT64(
-            &MF_MT_FRAME_RATE,
-            pack_u32_pair(FRAME_RATE_NUMERATOR, FRAME_RATE_DENOMINATOR),
-        )?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(format.width, format.height))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(format.fps_num, format.fps_den))?;
         media_type.SetUINT64(
             &MF_MT_FRAME_RATE_RANGE_MIN,
-            pack_u32_pair(FRAME_RATE_NUMERATOR, FRAME_RATE_DENOMINATOR),
+            pack_u32_pair(format.fps_num, format.fps_den),
         )?;
         media_type.SetUINT64(
             &MF_MT_FRAME_RATE_RANGE_MAX,
-            pack_u32_pair(FRAME_RATE_NUMERATOR, FRAME_RATE_DENOMINATOR),
+            pack_u32_pair(format.fps_num, format.fps_den),
         )?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
         media_type.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
@@ -464,7 +634,7 @@ fn create_media_type(subtype: GUID, sample_size: u32, stride: u32) -> Result<IMF
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         media_type.SetUINT32(
             &MF_MT_AVG_BITRATE,
-            sample_size.saturating_mul(FRAME_RATE_NUMERATOR).saturating_mul(8),
+            sample_size.saturating_mul(format.fps_num).saturating_mul(8),
         )?;
     }
     Ok(media_type)
@@ -499,4 +669,8 @@ fn queue_unknown_event(
 ) -> Result<()> {
     let event = CustomMediaEvent::from_unknown(event_type, value)?;
     unsafe { queue.QueueEvent(&event) }
+}
+
+pub fn try_open_shared_feed_provider() -> Result<Option<SharedMemoryFeedProvider>> {
+    SharedMemoryFeedProvider::open_active()
 }

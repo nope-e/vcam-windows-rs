@@ -72,14 +72,14 @@ function Invoke-External {
 function Build-Project {
     Ensure-Cargo
 
-    $cargoArgs = @('build', '--bin', 'vcamctl')
+    $cargoArgs = @('build', '--workspace')
     if ($Configuration -eq 'Release') {
         $cargoArgs += '--release'
     }
 
     Push-Location $script:RepoRoot
     try {
-        Invoke-External -FilePath 'cargo' -Arguments $cargoArgs -DisplayName "Build vcamctl ($Configuration)"
+        Invoke-External -FilePath 'cargo' -Arguments $cargoArgs -DisplayName "Build workspace ($Configuration)"
     }
     finally {
         Pop-Location

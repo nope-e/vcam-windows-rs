@@ -10,7 +10,9 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
-use crate::constants::{ACTIVATE_CLSID_STRING, FRIENDLY_NAME};
+use crate::constants::{
+    ACTIVATE_CLSID_STRING, FRAME_BROKER_CLSID_STRING, FRAME_BROKER_NAME, FRIENDLY_NAME,
+};
 
 unsafe extern "C" {
     static __ImageBase: IMAGE_DOS_HEADER;
@@ -44,27 +46,15 @@ pub fn register_server(scope: RegistryScope, module_path: Option<&Path>) -> Resu
         Some(path) => path.to_path_buf(),
         None => current_module_path()?,
     };
-    let clsid_path = format!("Software\\Classes\\CLSID\\{ACTIVATE_CLSID_STRING}");
-    let inproc_path = format!("{clsid_path}\\InprocServer32");
     let root = scope.root_key();
-
-    write_reg_sz(root, &clsid_path, None, FRIENDLY_NAME)?;
-    write_reg_sz(root, &inproc_path, None, &module_path.to_string_lossy())?;
-    write_reg_sz(root, &inproc_path, Some("ThreadingModel"), "Both")?;
+    register_clsid(root, ACTIVATE_CLSID_STRING, FRIENDLY_NAME, &module_path)?;
+    register_clsid(root, FRAME_BROKER_CLSID_STRING, FRAME_BROKER_NAME, &module_path)?;
     Ok(())
 }
 
 pub fn unregister_server(scope: RegistryScope) -> Result<()> {
-    let clsid_path = format!("Software\\Classes\\CLSID\\{ACTIVATE_CLSID_STRING}");
-    let clsid_path_w = wide_null(&clsid_path);
-    unsafe {
-        let status = RegDeleteTreeW(scope.root_key(), PCWSTR(clsid_path_w.as_ptr()));
-        if status == ERROR_FILE_NOT_FOUND {
-            Ok(())
-        } else {
-            status.ok()
-        }
-    }
+    unregister_clsid(scope.root_key(), ACTIVATE_CLSID_STRING)?;
+    unregister_clsid(scope.root_key(), FRAME_BROKER_CLSID_STRING)
 }
 
 fn current_module_path() -> Result<PathBuf> {
@@ -119,6 +109,28 @@ fn write_reg_sz(root: HKEY, path: &str, name: Option<&str>, value: &str) -> Resu
     }
 
     Ok(())
+}
+
+fn register_clsid(root: HKEY, clsid: &str, display_name: &str, module_path: &Path) -> Result<()> {
+    let clsid_path = format!("Software\\Classes\\CLSID\\{clsid}");
+    let inproc_path = format!("{clsid_path}\\InprocServer32");
+
+    write_reg_sz(root, &clsid_path, None, display_name)?;
+    write_reg_sz(root, &inproc_path, None, &module_path.to_string_lossy())?;
+    write_reg_sz(root, &inproc_path, Some("ThreadingModel"), "Both")
+}
+
+fn unregister_clsid(root: HKEY, clsid: &str) -> Result<()> {
+    let clsid_path = format!("Software\\Classes\\CLSID\\{clsid}");
+    let clsid_path_w = wide_null(&clsid_path);
+    unsafe {
+        let status = RegDeleteTreeW(root, PCWSTR(clsid_path_w.as_ptr()));
+        if status == ERROR_FILE_NOT_FOUND {
+            Ok(())
+        } else {
+            status.ok()
+        }
+    }
 }
 
 fn wide_null(value: &str) -> Vec<u16> {

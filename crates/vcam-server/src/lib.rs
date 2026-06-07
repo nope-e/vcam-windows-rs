@@ -7,18 +7,34 @@ use windows::core::{GUID, HRESULT};
 use windows::Win32::Foundation::{S_FALSE, S_OK};
 
 mod activate;
+mod broker;
 mod class_factory;
 mod constants;
+mod feed_shared;
 mod media_event;
 mod media_source;
 mod media_stream;
 pub mod registration;
 mod test_pattern;
+mod video_format;
 
-pub use constants::{ACTIVATE_CLSID, ACTIVATE_CLSID_STRING, FRIENDLY_NAME};
-pub use test_pattern::{
-    validate_dump_path, write_bgra_bmp, write_nv12_bmp, StaticTestPattern,
+pub use broker::{create_frame_broker, IVcamFrameBroker};
+pub use constants::{
+    ACTIVATE_CLSID, ACTIVATE_CLSID_STRING, FRAME_BROKER_CLSID, FRAME_BROKER_CLSID_STRING,
+    FRIENDLY_NAME,
 };
+pub use feed_shared::{
+    feed_control_file_path, feed_data_file_path, feed_mutex_name, feed_shared_root_path,
+    query_feed_state, reset_feed_session, start_feed_session, stop_feed_session,
+    try_active_video_format, FeedFrame, FeedSessionProducer, FeedSessionReader,
+    VCAM_FEED_CONFIG, VCAM_FEED_STATE, VcamSharedFeedControl, VcamSharedFeedSlotHeader,
+};
+pub use test_pattern::{
+    bgra_to_nv12_bytes, copy_bgra_to_surface, copy_nv12_to_surface, nv12_to_bgra_bytes,
+    validate_dump_path, write_bgra_bmp, write_bgra_bmp_for_format, write_nv12_bmp,
+    write_nv12_bmp_for_format, StaticTestPattern,
+};
+pub use video_format::VideoFormat;
 
 pub fn debug_log(message: &str) {
     if std::env::var_os("VCAM_TRACE").is_none() {

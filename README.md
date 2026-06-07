@@ -2,20 +2,21 @@
 
 # Caution
 ## This project is fully written by AI and haven't be manually reviewed.
-## It is now under its early development stage, and currently only displays a static test pattern at 1920*1080@60fps.
-## There is no implement of video/data feeding.
+## It is now under its early development stage.
+## The current prototype can still fall back to a static test pattern, but it now also includes a broker COM + shared memory feed path for animated BGRA frame injection.
 ## So, use at your own risk!
 
 # Intro
-这是一个基于 Rust 的 Windows 虚拟摄像头原型。当前实现使用 `windows-rs` 调用 Media Foundation / Win32 API，并通过自定义 COM 媒体源重复输出一张程序内生成的静态测试图。
+这是一个基于 Rust 的 Windows 虚拟摄像头原型。当前实现使用 `windows-rs` 调用 Media Foundation / Win32 API，并通过自定义 COM 媒体源输出静态测试图，或通过 broker COM 控制面 + 共享内存数据面输出动态 BGRA 帧。
 
 当前目标仍然是原型验证，不是可发布的生产级虚拟摄像头。
 
 ## 当前状态
 
-- `cargo build` 通过。
+- `cargo build --workspace` 通过。
 - `vcamctl dump-frame` 可以在本地导出静态测试图 BMP。
-- `vcamctl dump-com-frame` 和 `scripts/test-com-frame.ps1` 已验证可以直接通过 COM server 拉出首帧，并对 `RGB32` / `NV12` 两种格式做内容校验。
+- `vcamctl dump-com-frame` 和 `scripts/test-com-frame.ps1` 已验证可以直接通过 COM server 拉帧；feed inactive 时校验静态图内容，feed active 时校验动态样本尺寸与时间戳。
+- `vcamfeed-demo stream-animated` 已验证可以通过 broker COM 建会话，并通过共享内存持续写入变化中的 BGRA 帧。
 - 使用机器级 COM 注册后，Windows 已经可以枚举到该虚拟摄像头设备。
 - 当前仍在继续排查部分应用中的预览黑屏问题；最近一轮修复了自定义 stream/source 事件在系统 `MFCreateMediaEvent` / `QueueEventParam*` 路径上的崩溃，并把本地调试取帧路径切回稳定的内存 sample 分配。
 
@@ -28,7 +29,7 @@
 ## 构建
 
 ```powershell
-cargo build
+cargo build --workspace
 ```
 
 ## 快速安装
@@ -92,6 +93,12 @@ cargo run -p vcamctl -- dump-com-frame target\com-rgb32.bmp --subtype rgb32
 pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-com-frame.ps1
 ```
 
+启动共享内存 animated feed，并让虚拟摄像头输出连续变化画面：
+
+```powershell
+cargo run -p vcamfeed-demo -- stream-animated --width 640 --height 480 --fps 10 --duration-seconds 10 --force-reset
+```
+
 探测当前系统是否支持创建虚拟摄像头对象：
 
 ```powershell
@@ -118,10 +125,12 @@ cargo run -p vcamctl -- remove-camera
 ## 当前原型能力
 
 - 暴露 `cdylib` COM 服务器和 Media Foundation 自定义媒体源。
+- 新增 `IVcamFrameBroker` COM 类，负责 feed 会话启动、停止、状态查询和重置。
 - 实现 `IMFActivate`、`IMFMediaSourceEx`、`IMFMediaStream2`、`IKsControl`、`IMFSampleAllocatorControl`。
 - 程序内生成固定测试图，不依赖运行时文件 IO。
+- 支持 broker COM 控制面 + 共享内存数据面的动态 BGRA 灌帧。
 - 同时声明 `RGB32` 和 `NV12` 媒体类型。
-- 提供 COM 注册、虚拟摄像头创建/移除、测试帧导出、直接 COM 拉帧校验的辅助 CLI。
+- 提供 COM 注册、虚拟摄像头创建/移除、测试帧导出、直接 COM 拉帧校验的辅助 CLI，以及 animated feeder demo。
 
 ## 已知限制
 

@@ -20,8 +20,12 @@ use windows_core::PROPVARIANT;
 
 use crate::constants::{FRIENDLY_NAME, STREAM_ID};
 use crate::debug_log;
+use crate::feed_shared::try_active_video_format;
 use crate::media_event::CustomMediaEvent;
-use crate::media_stream::{SourceReference, StaticImageMediaStream, StreamShared};
+use crate::media_stream::{
+    try_open_shared_feed_provider, SourceReference, StaticImageMediaStream, StreamShared,
+};
+use crate::video_format::VideoFormat;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceState {
@@ -132,7 +136,20 @@ impl StaticImageMediaSource {
     pub fn create() -> Result<IMFMediaSourceEx> {
         debug_log("StaticImageMediaSource::create");
         let source_ref = SourceReference::new();
-        let (stream_shared, _stream_iface) = StaticImageMediaStream::create(source_ref.clone())?;
+        let active_format = try_active_video_format()?.unwrap_or_else(VideoFormat::default);
+        let shared_provider = match try_open_shared_feed_provider() {
+            Ok(provider) => provider,
+            Err(err) => {
+                debug_log(&format!("shared provider unavailable, falling back to static pattern: {err}"));
+                None
+            }
+        };
+        let stream_format = shared_provider
+            .as_ref()
+            .map(|provider| provider.format())
+            .unwrap_or(active_format);
+        let (stream_shared, _stream_iface) =
+            StaticImageMediaStream::create(source_ref.clone(), stream_format, shared_provider)?;
         let stream_descriptors = [Some(stream_shared.descriptor())];
         let presentation_descriptor = unsafe { MFCreatePresentationDescriptor(Some(&stream_descriptors))? };
         let attributes = create_source_attributes()?;
