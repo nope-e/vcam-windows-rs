@@ -3,6 +3,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{Error, PCWSTR, Result};
 use windows::Win32::Foundation::{
@@ -169,6 +170,8 @@ pub struct FeedFrame {
     pub bgra: Arc<[u8]>,
 }
 
+const FEED_STALE_GRACE_MS_MIN: u64 = 1_500;
+
 pub fn feed_shared_root_path() -> PathBuf {
     let public_root = std::env::var_os("PUBLIC")
         .map(PathBuf::from)
@@ -216,7 +219,10 @@ pub fn start_feed_session(config: VCAM_FEED_CONFIG, force_reset: bool) -> Result
     let data = MappedMemory::create_or_open(&feed_data_file_path(), data_bytes)?;
     let control_ptr = control.view.as_mut_ptr::<VcamSharedFeedControl>();
 
-    if is_valid_control(control_ptr) && read_control_active(control_ptr) && !force_reset {
+    if is_valid_control(control_ptr) {
+        deactivate_stale_session_locked(control_ptr);
+    }
+    if is_valid_control(control_ptr) && read_control_active_bit(control_ptr) && !force_reset {
         return Err(Error::new(
             ERROR_BUSY.to_hresult(),
             "a shared-memory feed session is already active",
@@ -251,6 +257,8 @@ pub fn stop_feed_session() -> Result<()> {
     if is_valid_control(control_ptr) {
         unsafe {
             write_volatile(addr_of_mut!((*control_ptr).active), 0);
+            write_volatile(addr_of_mut!((*control_ptr).reserved0), 0);
+            write_volatile(addr_of_mut!((*control_ptr).reserved1), 0);
         }
     }
     session_keepalive()
@@ -358,7 +366,7 @@ impl FeedSessionProducer {
                 ),
             ));
         }
-        if !read_control_active(self.control_ptr) {
+        if !read_control_active_bit(self.control_ptr) {
             return Err(Error::new(E_FAIL.into(), "shared-memory feed session is inactive"));
         }
 
@@ -374,6 +382,7 @@ impl FeedSessionProducer {
             write_volatile(addr_of_mut!((*slot_header).timestamp_100ns), timestamp_100ns);
             write_volatile(addr_of_mut!((*slot_header).frame_id), frame_id);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            write_control_heartbeat_ms(self.control_ptr, current_unix_time_ms());
             write_volatile(addr_of_mut!((*self.control_ptr).last_timestamp_100ns), timestamp_100ns);
             write_volatile(addr_of_mut!((*self.control_ptr).committed_slot), slot_index as u32);
             write_volatile(addr_of_mut!((*self.control_ptr).committed_frame_id), frame_id);
@@ -677,6 +686,7 @@ fn read_state_locked() -> Result<VCAM_FEED_STATE> {
     if !is_valid_control(control_ptr) {
         return Ok(VCAM_FEED_STATE::default());
     }
+    deactivate_stale_session_locked(control_ptr.cast_mut());
 
     let config = read_control_config(control_ptr);
     Ok(VCAM_FEED_STATE {
@@ -697,13 +707,14 @@ fn write_control_header(control_ptr: *mut VcamSharedFeedControl, config: &VCAM_F
     unsafe {
         write_volatile(addr_of_mut!((*control_ptr).magic), VCAM_FEED_MAGIC);
         write_volatile(addr_of_mut!((*control_ptr).version), VCAM_FEED_VERSION);
-        write_volatile(addr_of_mut!((*control_ptr).active), 1);
         write_volatile(addr_of_mut!((*control_ptr).config), *config);
         write_volatile(addr_of_mut!((*control_ptr).slot_count), VCAM_FEED_SLOT_COUNT);
         write_volatile(addr_of_mut!((*control_ptr).slot_bytes), slot_bytes);
         write_volatile(addr_of_mut!((*control_ptr).committed_slot), VCAM_INVALID_SLOT_INDEX);
         write_volatile(addr_of_mut!((*control_ptr).committed_frame_id), 0);
         write_volatile(addr_of_mut!((*control_ptr).last_timestamp_100ns), 0);
+        write_control_heartbeat_ms(control_ptr, current_unix_time_ms());
+        write_volatile(addr_of_mut!((*control_ptr).active), 1);
     }
 }
 
@@ -715,6 +726,10 @@ fn is_valid_control(control_ptr: *const VcamSharedFeedControl) -> bool {
 }
 
 fn read_control_active(control_ptr: *const VcamSharedFeedControl) -> bool {
+    read_control_active_bit(control_ptr) && is_control_heartbeat_fresh(control_ptr)
+}
+
+fn read_control_active_bit(control_ptr: *const VcamSharedFeedControl) -> bool {
     unsafe { read_volatile(addr_of!((*control_ptr).active)) != 0 }
 }
 
@@ -740,6 +755,58 @@ fn read_control_committed_frame_id(control_ptr: *const VcamSharedFeedControl) ->
 
 fn read_control_last_timestamp(control_ptr: *const VcamSharedFeedControl) -> i64 {
     unsafe { read_volatile(addr_of!((*control_ptr).last_timestamp_100ns)) }
+}
+
+fn read_control_heartbeat_ms(control_ptr: *const VcamSharedFeedControl) -> u64 {
+    let low = unsafe { read_volatile(addr_of!((*control_ptr).reserved0)) } as u64;
+    let high = unsafe { read_volatile(addr_of!((*control_ptr).reserved1)) } as u64;
+    (high << 32) | low
+}
+
+fn write_control_heartbeat_ms(control_ptr: *mut VcamSharedFeedControl, value: u64) {
+    unsafe {
+        write_volatile(addr_of_mut!((*control_ptr).reserved0), value as u32);
+        write_volatile(addr_of_mut!((*control_ptr).reserved1), (value >> 32) as u32);
+    }
+}
+
+fn deactivate_stale_session_locked(control_ptr: *mut VcamSharedFeedControl) {
+    if !read_control_active_bit(control_ptr) || is_control_heartbeat_fresh(control_ptr) {
+        return;
+    }
+    debug_log("shared feed heartbeat expired; deactivating stale session");
+    unsafe {
+        write_volatile(addr_of_mut!((*control_ptr).active), 0);
+    }
+}
+
+fn is_control_heartbeat_fresh(control_ptr: *const VcamSharedFeedControl) -> bool {
+    let heartbeat_ms = read_control_heartbeat_ms(control_ptr);
+    if heartbeat_ms == 0 {
+        return false;
+    }
+
+    let threshold_ms = feed_stale_threshold_ms(read_control_config(control_ptr));
+    current_unix_time_ms().saturating_sub(heartbeat_ms) <= threshold_ms
+}
+
+fn feed_stale_threshold_ms(config: VCAM_FEED_CONFIG) -> u64 {
+    if config.fps_num == 0 {
+        return FEED_STALE_GRACE_MS_MIN;
+    }
+    let frame_ms = ((config.fps_den as u64)
+        .saturating_mul(4_000)
+        .saturating_add(config.fps_num as u64 - 1))
+        / config.fps_num as u64;
+    frame_ms.max(FEED_STALE_GRACE_MS_MIN)
+}
+
+fn current_unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn slot_region_bytes(payload_bytes: usize) -> Result<usize> {

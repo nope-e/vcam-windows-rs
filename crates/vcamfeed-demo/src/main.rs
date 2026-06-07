@@ -1,11 +1,18 @@
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::core::{Error, Result};
 use windows::Win32::Foundation::{BOOL, E_FAIL};
+use windows::Win32::System::Console::{
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
+    CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+};
 
 use vcam_server::{create_frame_broker, FeedSessionProducer, VCAM_FEED_CONFIG, VideoFormat};
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     let _runtime = com::runtime::init_runtime()
@@ -78,6 +85,7 @@ fn stream_animated(options: StreamOptions) -> Result<()> {
     let format = VideoFormat::new(options.width, options.height, options.fps, 1)?;
     let config = VCAM_FEED_CONFIG::from_video_format(format);
     let broker = create_frame_broker()?;
+    let _ctrl_handler = ConsoleCtrlHandlerGuard::install()?;
 
     unsafe {
         broker.StartSession(&config, BOOL(options.force_reset as i32))?;
@@ -90,7 +98,7 @@ fn stream_animated(options: StreamOptions) -> Result<()> {
         let start = Instant::now();
         let mut frame_id = 0u64;
 
-        while start.elapsed() < duration {
+        while start.elapsed() < duration && !INTERRUPTED.load(Ordering::SeqCst) {
             let frame = render_animated_frame(format, frame_id);
             let timestamp_100ns = frame_id as i64 * format.frame_duration_100ns();
             producer.publish_bgra_frame(frame_id, timestamp_100ns, &frame)?;
@@ -100,10 +108,17 @@ fn stream_animated(options: StreamOptions) -> Result<()> {
             sleep_until(next_deadline);
         }
 
-        println!(
-            "published {frame_id} frames at {}x{} {}fps",
-            format.width, format.height, format.fps_num
-        );
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            println!(
+                "interrupted after {frame_id} frames at {}x{} {}fps",
+                format.width, format.height, format.fps_num
+            );
+        } else {
+            println!(
+                "published {frame_id} frames at {}x{} {}fps",
+                format.width, format.height, format.fps_num
+            );
+        }
         Ok(())
     })();
 
@@ -111,6 +126,36 @@ fn stream_animated(options: StreamOptions) -> Result<()> {
         let _ = broker.StopSession();
     }
     stop_result
+}
+
+struct ConsoleCtrlHandlerGuard;
+
+impl ConsoleCtrlHandlerGuard {
+    fn install() -> Result<Self> {
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        unsafe {
+            SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1))?;
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ConsoleCtrlHandlerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(0));
+        }
+    }
+}
+
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+            INTERRUPTED.store(true, Ordering::SeqCst);
+            BOOL(1)
+        }
+        _ => BOOL(0),
+    }
 }
 
 fn render_animated_frame(format: VideoFormat, frame_id: u64) -> Vec<u8> {
@@ -264,9 +309,12 @@ fn set_pixel(frame: &mut [u8], stride: usize, x: usize, y: usize, color: [u8; 4]
 }
 
 fn sleep_until(deadline: Instant) {
-    let now = Instant::now();
-    if deadline > now {
-        thread::sleep(deadline - now);
+    while !INTERRUPTED.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if deadline <= now {
+            break;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(50)));
     }
 }
 
