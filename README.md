@@ -65,7 +65,7 @@ pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\manage-vcam.
 
 ## 安装脚本行为说明
 
-- `Install` 会先构建项目，再把 DLL 复制到 `C:\ProgramData\vcam-windows-rs\<debug|release>\vcam_windows_rs.dll`。
+- `Install` 会先构建项目，再把 DLL 复制到 `C:\ProgramData\vcam-windows-rs\<debug|release>\vcam_server.dll`。
 - 注册使用的是机器级 COM，而不是当前用户级 `HKCU` 注册。
 - 创建虚拟摄像头时使用的是 `System` 生命周期，因此设备不会随着 `vcamctl create-camera` 进程退出而立刻消失。
 - 重新编译后，如果安装路径和配置未变，通常重新执行 `Register` 和 `Create` 即可。
@@ -77,13 +77,13 @@ pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\manage-vcam.
 导出静态测试图：
 
 ```powershell
-cargo run --bin vcamctl -- dump-frame target\static-test-pattern.bmp
+cargo run -p vcamctl -- dump-frame target\static-test-pattern.bmp
 ```
 
 直接通过 COM server 拉一帧并导出为 BMP：
 
 ```powershell
-cargo run --bin vcamctl -- dump-com-frame target\com-rgb32.bmp --subtype rgb32
+cargo run -p vcamctl -- dump-com-frame target\com-rgb32.bmp --subtype rgb32
 ```
 
 也可以一次性验证两种格式：
@@ -95,19 +95,19 @@ pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-com-fra
 探测当前系统是否支持创建虚拟摄像头对象：
 
 ```powershell
-cargo run --bin vcamctl -- probe-create
+cargo run -p vcamctl -- probe-create
 ```
 
 手动创建虚拟摄像头：
 
 ```powershell
-cargo run --bin vcamctl -- create-camera
+cargo run -p vcamctl -- create-camera
 ```
 
 手动移除虚拟摄像头：
 
 ```powershell
-cargo run --bin vcamctl -- remove-camera
+cargo run -p vcamctl -- remove-camera
 ```
 
 如果你确实需要手动注册 COM：

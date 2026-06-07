@@ -1,0 +1,12 @@
+[package]
+name = "vcam-server"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+com.workspace = true
+windows.workspace = true
+windows-core.workspace = true

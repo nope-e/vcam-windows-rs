@@ -1,0 +1,10 @@
+[package]
+name = "vcamctl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+com.workspace = true
+vcam-server = { path = "../vcam-server" }
+windows.workspace = true
+windows-core.workspace = true

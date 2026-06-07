@@ -80,10 +80,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
-name = "vcam-windows-rs"
+name = "vcam-server"
 version = "0.1.0"
 dependencies = [
  "com",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "vcamctl"
+version = "0.1.0"
+dependencies = [
+ "com",
+ "vcam-server",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "vcamfeed-demo"
+version = "0.1.0"
+dependencies = [
+ "com",
+ "vcam-server",
  "windows",
  "windows-core",
 ]

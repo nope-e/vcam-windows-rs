@@ -1,16 +1,16 @@
-[package]
-name = "vcam-windows-rs"
-version = "0.1.0"
+[workspace]
+members = [
+    "crates/vcam-server",
+    "crates/vcamctl",
+    "crates/vcamfeed-demo",
+]
+resolver = "2"
+
+[workspace.package]
 edition = "2024"
+version = "0.1.0"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "vcamctl"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 com = "0.6"
 windows = { version = "0.58", features = [
     "implement",
@@ -21,7 +21,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ] }
 windows-core = "0.58"

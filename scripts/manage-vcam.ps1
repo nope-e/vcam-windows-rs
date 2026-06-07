@@ -16,10 +16,10 @@ $script:RepoRoot = (Resolve-Path (Join-Path $script:ScriptDir '..')).Path
 $script:ProfileDir = if ($Configuration -eq 'Release') { 'release' } else { 'debug' }
 $script:TargetDir = Join-Path $script:RepoRoot "target\$script:ProfileDir"
 $script:VcamCtlPath = Join-Path $script:TargetDir 'vcamctl.exe'
-$script:BuildDllPath = Join-Path $script:TargetDir 'vcam_windows_rs.dll'
+$script:BuildDllPath = Join-Path $script:TargetDir 'vcam_server.dll'
 $script:InstallRoot = Join-Path $env:ProgramData 'vcam-windows-rs'
 $script:InstallDir = Join-Path $script:InstallRoot $script:ProfileDir
-$script:InstalledDllPath = Join-Path $script:InstallDir 'vcam_windows_rs.dll'
+$script:InstalledDllPath = Join-Path $script:InstallDir 'vcam_server.dll'
 
 function Write-Step {
     param([string]$Message)

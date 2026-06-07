@@ -18,11 +18,11 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
-use vcam_windows_rs::{
+use vcam_server::{
     debug_log, validate_dump_path, write_bgra_bmp, write_nv12_bmp, StaticTestPattern, ACTIVATE_CLSID,
     ACTIVATE_CLSID_STRING, FRIENDLY_NAME,
 };
-use vcam_windows_rs::registration::{self, RegistryScope};
+use vcam_server::registration::{self, RegistryScope};
 
 type DllExport = unsafe extern "system" fn() -> HRESULT;
 
@@ -545,11 +545,7 @@ fn describe_mismatch(expected: &[u8], actual: &[u8]) -> String {
 fn default_dll_path() -> Result<PathBuf> {
     let exe = env::current_exe()
         .map_err(|err| Error::new(E_FAIL.into(), format!("current_exe failed: {err}")))?;
-    let dll_name = if cfg!(debug_assertions) {
-        "vcam_windows_rs.dll"
-    } else {
-        "vcam_windows_rs.dll"
-    };
+    let dll_name = "vcam_server.dll";
     Ok(exe
         .parent()
         .ok_or_else(|| Error::new(E_FAIL.into(), "executable path has no parent"))?
@@ -582,11 +578,11 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  cargo run -- register-com [--scope user|machine] [--dll-path <path>]");
-    println!("  cargo run -- unregister-com [--scope user|machine]");
-    println!("  cargo run -- create-camera");
-    println!("  cargo run -- remove-camera");
-    println!("  cargo run -- probe-create");
-    println!("  cargo run -- dump-frame [path]");
-    println!("  cargo run -- dump-com-frame [path] [--subtype rgb32|nv12]");
+    println!("  cargo run -p vcamctl -- register-com [--scope user|machine] [--dll-path <path>]");
+    println!("  cargo run -p vcamctl -- unregister-com [--scope user|machine]");
+    println!("  cargo run -p vcamctl -- create-camera");
+    println!("  cargo run -p vcamctl -- remove-camera");
+    println!("  cargo run -p vcamctl -- probe-create");
+    println!("  cargo run -p vcamctl -- dump-frame [path]");
+    println!("  cargo run -p vcamctl -- dump-com-frame [path] [--subtype rgb32|nv12]");
 }
