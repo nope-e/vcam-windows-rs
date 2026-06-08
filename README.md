@@ -1,9 +1,7 @@
 # vcam-windows-rs
 
 # Caution
-## This project is fully written by AI and haven't be manually reviewed.
 ## It is now under its early development stage.
-## The current prototype can still fall back to a static test pattern, but it now also includes a broker COM + shared memory feed path for animated BGRA frame injection.
 ## So, use at your own risk!
 
 # Intro
