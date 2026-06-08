@@ -8,7 +8,6 @@ use windows::core::{Error, PCWSTR, Result};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, BOOL, E_FAIL, E_INVALIDARG, ERROR_ALREADY_EXISTS, ERROR_BUSY,
     ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE, HLOCAL, WAIT_ABANDONED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Security::Authorization::{
@@ -24,10 +23,7 @@ use windows::Win32::System::Memory::{
     PAGE_READWRITE, UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS,
 };
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcessId, OpenProcess, ReleaseMutex, WaitForSingleObject, INFINITE,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE};
 
 use crate::constants::{
     ACTIVATE_CLSID_STRING, VCAM_FEED_INPUT_FORMAT_BGRA8, VCAM_FEED_MAGIC, VCAM_FEED_SLOT_COUNT,
@@ -468,13 +464,24 @@ impl FeedSessionReader {
         }
 
         for _ in 0..2 {
+            if !read_control_active(self.control_ptr) {
+                return Ok(None);
+            }
             let committed_frame_id_before = read_control_committed_frame_id(self.control_ptr);
             let committed_slot = read_control_committed_slot(self.control_ptr);
             if committed_slot == VCAM_INVALID_SLOT_INDEX {
                 return Ok(None);
             }
 
-            let frame = self.copy_slot_frame(committed_slot as usize, committed_frame_id_before)?;
+            let frame = match self.copy_slot_frame(committed_slot as usize, committed_frame_id_before) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    debug_log(&format!(
+                        "shared feed frame copy was inconsistent; retrying/falling back: {err}"
+                    ));
+                    continue;
+                }
+            };
             let committed_frame_id_after = read_control_committed_frame_id(self.control_ptr);
             if committed_frame_id_before == committed_frame_id_after {
                 return Ok(Some(frame));
@@ -717,7 +724,7 @@ fn write_control_header(control_ptr: *mut VcamSharedFeedControl, config: &VCAM_F
         write_volatile(addr_of_mut!((*control_ptr).committed_slot), VCAM_INVALID_SLOT_INDEX);
         write_volatile(addr_of_mut!((*control_ptr).committed_frame_id), 0);
         write_volatile(addr_of_mut!((*control_ptr).last_timestamp_100ns), 0);
-        write_control_producer_pid(control_ptr, current_process_id());
+        write_volatile(addr_of_mut!((*control_ptr).reserved0), 0);
         write_control_heartbeat_tick(control_ptr, current_tick_ms());
         write_volatile(addr_of_mut!((*control_ptr).active), 1);
     }
@@ -731,9 +738,7 @@ fn is_valid_control(control_ptr: *const VcamSharedFeedControl) -> bool {
 }
 
 fn read_control_active(control_ptr: *const VcamSharedFeedControl) -> bool {
-    read_control_active_bit(control_ptr)
-        && is_control_producer_alive(control_ptr)
-        && is_control_heartbeat_fresh(control_ptr)
+    read_control_active_bit(control_ptr) && is_control_heartbeat_fresh(control_ptr)
 }
 
 fn read_control_active_bit(control_ptr: *const VcamSharedFeedControl) -> bool {
@@ -764,16 +769,6 @@ fn read_control_last_timestamp(control_ptr: *const VcamSharedFeedControl) -> i64
     unsafe { read_volatile(addr_of!((*control_ptr).last_timestamp_100ns)) }
 }
 
-fn read_control_producer_pid(control_ptr: *const VcamSharedFeedControl) -> u32 {
-    unsafe { read_volatile(addr_of!((*control_ptr).reserved0)) }
-}
-
-fn write_control_producer_pid(control_ptr: *mut VcamSharedFeedControl, value: u32) {
-    unsafe {
-        write_volatile(addr_of_mut!((*control_ptr).reserved0), value);
-    }
-}
-
 fn read_control_heartbeat_tick(control_ptr: *const VcamSharedFeedControl) -> u32 {
     unsafe { read_volatile(addr_of!((*control_ptr).reserved1)) }
 }
@@ -788,7 +783,7 @@ fn deactivate_stale_session_locked(control_ptr: *mut VcamSharedFeedControl) {
     if !read_control_active_bit(control_ptr) {
         return;
     }
-    if is_control_producer_alive(control_ptr) && is_control_heartbeat_fresh(control_ptr) {
+    if is_control_heartbeat_fresh(control_ptr) {
         return;
     }
     debug_log("shared feed heartbeat expired; deactivating stale session");
@@ -807,10 +802,6 @@ fn is_control_heartbeat_fresh(control_ptr: *const VcamSharedFeedControl) -> bool
     current_tick_ms().wrapping_sub(heartbeat_tick) <= threshold_ms
 }
 
-fn is_control_producer_alive(control_ptr: *const VcamSharedFeedControl) -> bool {
-    is_process_alive(read_control_producer_pid(control_ptr))
-}
-
 fn feed_stale_threshold_ms(config: VCAM_FEED_CONFIG) -> u32 {
     if config.fps_num == 0 {
         return FEED_STALE_GRACE_MS_MIN;
@@ -824,32 +815,8 @@ fn feed_stale_threshold_ms(config: VCAM_FEED_CONFIG) -> u32 {
         .max(FEED_STALE_GRACE_MS_MIN as u64) as u32
 }
 
-fn current_process_id() -> u32 {
-    unsafe { GetCurrentProcessId() }
-}
-
 fn current_tick_ms() -> u32 {
     unsafe { GetTickCount() }
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
-    let process = match unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            BOOL(0),
-            pid,
-        )
-    } {
-        Ok(handle) => OwnedHandle(handle),
-        Err(_) => return false,
-    };
-
-    let wait = unsafe { WaitForSingleObject(process.0, 0) };
-    wait == WAIT_TIMEOUT
 }
 
 fn slot_region_bytes(payload_bytes: usize) -> Result<usize> {
