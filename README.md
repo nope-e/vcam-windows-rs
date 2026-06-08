@@ -9,15 +9,6 @@
 
 当前目标仍然是原型验证，不是可发布的生产级虚拟摄像头。
 
-## 当前状态
-
-- `cargo build --workspace` 通过。
-- `vcamctl dump-frame` 可以在本地导出静态测试图 BMP。
-- `vcamctl dump-com-frame` 和 `scripts/test-com-frame.ps1` 已验证可以直接通过 COM server 拉帧；feed inactive 时校验静态图内容，feed active 时校验动态样本尺寸与时间戳。
-- `vcamfeed-demo stream-animated` 已验证可以通过 broker COM 建会话，并通过共享内存持续写入变化中的 BGRA 帧。
-- 使用机器级 COM 注册后，Windows 已经可以枚举到该虚拟摄像头设备。
-- 当前仍在继续排查部分应用中的预览黑屏问题；最近一轮修复了自定义 stream/source 事件在系统 `MFCreateMediaEvent` / `QueueEventParam*` 路径上的崩溃，并把本地调试取帧路径切回稳定的内存 sample 分配。
-
 ## 环境要求
 
 - Windows 11 22000 或更高版本。
